@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Build collaboration"
+  short_description: "Use Grok for review, debate, verification, and delegation"
+  default_prompt: "Use $grok-build to ask Grok for an independent, evidence-grounded review."
+policy:
+  allow_implicit_invocation: true

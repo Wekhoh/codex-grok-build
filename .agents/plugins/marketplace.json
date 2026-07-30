@@ -1,0 +1,20 @@
+{
+  "name": "codex-grok-build",
+  "interface": {
+    "displayName": "Codex Grok Build"
+  },
+  "plugins": [
+    {
+      "name": "grok-build",
+      "source": {
+        "source": "local",
+        "path": "./plugins/grok-build"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

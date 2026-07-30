@@ -1,0 +1,41 @@
+{
+  "name": "grok-build",
+  "version": "0.1.0",
+  "description": "Use xAI Grok Build from Codex for independent review, debate, verification, delegation, and parallel agent work.",
+  "author": {
+    "name": "Wekhoh",
+    "url": "https://github.com/Wekhoh"
+  },
+  "homepage": "https://github.com/Wekhoh/codex-grok-build",
+  "repository": "https://github.com/Wekhoh/codex-grok-build",
+  "license": "Apache-2.0",
+  "keywords": [
+    "grok",
+    "xai",
+    "codex",
+    "review",
+    "debate",
+    "delegation",
+    "multi-agent"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Grok Build for Codex",
+    "shortDescription": "Orchestrate Grok for review, debate, verification, and delegation",
+    "longDescription": "Use the official Grok CLI and xAI bridge from Codex for independent consultation, adversarial review, evidence-based verification, design debate, parallel research, and bounded implementation delegation. Dynamically selects the highest available stable model and reasoning effort.",
+    "developerName": "Wekhoh",
+    "category": "Productivity",
+    "capabilities": [
+      "CLI orchestration",
+      "Read",
+      "Write",
+      "Concurrent agents"
+    ],
+    "websiteURL": "https://github.com/Wekhoh/codex-grok-build",
+    "defaultPrompt": [
+      "Ask Codex and Grok to debate this design and return an evidence-grounded decision.",
+      "Have Grok independently review the current changes, then let Codex verify every finding.",
+      "Use parallel Grok roles to investigate multiple approaches and reconcile the results."
+    ]
+  }
+}

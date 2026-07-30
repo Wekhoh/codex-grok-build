@@ -1,0 +1,15 @@
+{
+  "name": "codex-grok-build",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A Codex plugin for orchestrating xAI Grok Build as an independent coding collaborator.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "check": "node --check plugins/grok-build/scripts/grok-codex.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

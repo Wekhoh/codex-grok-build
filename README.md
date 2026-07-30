@@ -1,0 +1,167 @@
+# Codex Grok Build
+
+Use xAI Grok Build from Codex as an independent coding collaborator for
+consultation, adversarial review, debate, verification, implementation
+delegation, parallel research, and Grok-managed subagents.
+
+This project is a Codex-native adapter around the real Grok CLI and xAI's
+official Grok Build bridge. It does not emulate Grok, proxy through an
+unofficial API, or redistribute the official bridge.
+
+## Why this exists
+
+xAI publishes an official Grok Build plugin for Claude Code. Codex Grok Build
+keeps that official bridge as the execution foundation and adds:
+
+- Codex plugin packaging and skill discovery
+- Safe stable-channel CLI and bridge synchronization
+- Dynamic selection of the highest available stable flagship model
+- Dynamic selection of the highest reasoning effort exposed by the bridge
+- Direct Grok CLI access for native subagent workflows
+- Collaboration patterns for debate, verification, and parallel review
+- Output-quality gates: process completion is not treated as answer acceptance
+
+## Requirements
+
+- Codex with plugin support
+- Node.js 18.18 or newer
+- Git
+- The official Grok CLI available as grok on PATH
+- A logged-in Grok CLI session; grok models must succeed
+
+Follow xAI's official Grok Build documentation to install and authenticate the
+Grok CLI: https://github.com/xai-org/grok-build-plugin-cc
+
+## Install
+
+Add this repository as a Codex marketplace:
+
+~~~powershell
+codex plugin marketplace add Wekhoh/codex-grok-build
+~~~
+
+Install the plugin:
+
+~~~powershell
+codex plugin add grok-build@codex-grok-build
+~~~
+
+Start a new Codex conversation after installation so the bundled skill is
+discovered.
+
+To update later:
+
+~~~powershell
+codex plugin marketplace upgrade codex-grok-build
+codex plugin add grok-build@codex-grok-build
+~~~
+
+Start a new conversation after reinstalling so Codex loads the updated skill.
+
+## Use
+
+Ask Codex naturally:
+
+- Ask Grok to independently review this change and verify every finding.
+- Have Codex and Grok debate this architecture before choosing a design.
+- Let Grok implement the bounded change, then have Codex inspect the diff and
+  run the tests.
+- Ask one Grok leader to start three read-only subagents for architecture,
+  correctness, and security.
+- Run two independent Grok investigations concurrently and reconcile the
+  disagreement.
+
+The installed skill resolves the adapter from its own plugin directory. No
+developer-specific absolute paths are required.
+
+## Adapter commands
+
+The adapter lives at plugins/grok-build/scripts/grok-codex.mjs.
+
+~~~text
+sync
+capabilities
+check
+run
+review
+critique
+runs
+show
+stop
+import
+direct
+~~~
+
+The adapter normally synchronizes before work. Pass --no-sync when a workflow
+already synchronized once. Set GROK_MODEL or GROK_REASONING_EFFORT only when an
+explicit override is required.
+
+The import command is a low-level pass-through to xAI's Claude-oriented bridge.
+It does not automatically discover or import the current Codex transcript; pass
+an explicit source supported by the upstream grok import command.
+
+Optional environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| GROK_BINARY | Override the Grok executable used by the adapter |
+| GROK_BUILD_REPOSITORY | Override the local official-bridge checkout path |
+| GROK_BUILD_PLUGIN_DATA | Override the writable run-state directory |
+| GROK_MODEL | Pin an available model |
+| GROK_REASONING_EFFORT | Pin a bridge-supported reasoning level |
+
+## Safety model
+
+- Read-only work uses plan permission mode and a read-only sandbox by default.
+- Write delegation must be explicit.
+- Concurrent writers must use separate Git worktrees.
+- Official bridge updates must come from the expected xAI origin, stay on main,
+  and fast-forward cleanly.
+- Codex remains responsible for verifying material claims, diffs, and tests.
+- Multiple model answers are correlated samples, not independent proof.
+
+## Known limitations
+
+- The upstream bridge currently has Windows-specific test and shell warnings.
+- Simultaneous background enqueue operations in one workspace can contend on
+  the bridge state lock; enqueue quickly one at a time, then let jobs run in
+  parallel.
+- A terminal completed status does not guarantee a complete answer.
+- High parent-session concurrency may cause cancellations or quota pressure.
+- Automatic upstream updates can expose compatibility changes; the adapter
+  validates origin and capabilities but cannot guarantee future APIs.
+
+## Development
+
+~~~powershell
+npm test
+~~~
+
+Validate the plugin with Codex's plugin creator when available:
+
+~~~powershell
+$env:PYTHONUTF8=1
+python path\to\plugin-creator\scripts\validate_plugin.py plugins\grok-build
+~~~
+
+## Architecture
+
+~~~text
+Codex
+  -> Codex Grok Build skill and adapter
+     -> xAI official Grok Build bridge
+        -> official Grok CLI
+           -> Grok
+~~~
+
+The official bridge is cloned to the user's Codex vendor directory on first
+sync. Runtime state is stored separately under the user's Codex plugin-data
+directory.
+
+## License and attribution
+
+Apache-2.0. See LICENSE and NOTICE.
+
+This is an independent community project and is not affiliated with xAI or
+OpenAI. Grok and xAI are trademarks of xAI. Codex and OpenAI are trademarks of
+OpenAI.

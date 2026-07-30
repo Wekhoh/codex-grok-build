@@ -1,0 +1,13 @@
+Codex Grok Build
+Copyright 2026 Wekhoh
+
+This project integrates with the xAI Grok Build CLI and the official
+Grok Build Plugin for Claude Code:
+https://github.com/xai-org/grok-build-plugin-cc
+
+The official bridge is not redistributed in this repository. It is cloned
+and validated at runtime under its own Apache-2.0 license.
+
+Grok and xAI are trademarks of xAI. Codex and OpenAI are trademarks of
+OpenAI. This project is independent and is not endorsed by, sponsored by,
+or affiliated with xAI or OpenAI.
