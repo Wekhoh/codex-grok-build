@@ -1,6 +1,6 @@
 {
   "name": "grok-build",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use xAI Grok Build from Codex for independent review, debate, verification, delegation, and parallel agent work.",
   "author": {
     "name": "Wekhoh",

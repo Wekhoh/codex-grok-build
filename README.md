@@ -14,7 +14,7 @@ xAI publishes an official Grok Build plugin for Claude Code. Codex Grok Build
 keeps that official bridge as the execution foundation and adds:
 
 - Codex plugin packaging and skill discovery
-- Safe stable-channel CLI and bridge synchronization
+- Stable-channel CLI updates and verified official-bridge synchronization
 - Dynamic selection of the highest available stable flagship model
 - Dynamic selection of the highest reasoning effort exposed by the bridge
 - Direct Grok CLI access for native subagent workflows
@@ -104,19 +104,28 @@ Optional environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| GROK_BINARY | Override the Grok executable used by the adapter |
+| GROK_BINARY | Override the Grok executable with an absolute path |
 | GROK_BUILD_REPOSITORY | Override the local official-bridge checkout path |
 | GROK_BUILD_PLUGIN_DATA | Override the writable run-state directory |
+| GROK_BUILD_COMMAND_TIMEOUT_MS | Bound update and capability probes (default 120000) |
+| GROK_BUILD_FORWARD_XAI_API_KEY | Set to 1 only when API-key auth must be forwarded |
 | GROK_MODEL | Pin an available model |
 | GROK_REASONING_EFFORT | Pin a bridge-supported reasoning level |
 
 ## Safety model
 
 - Read-only work uses plan permission mode and a read-only sandbox by default.
-- Write delegation must be explicit.
+- Write delegation must use `direct --write`; it is workspace-sandboxed and
+  does not auto-approve every tool. The separate `--unsafe-always-approve`
+  switch is available only with `--write`.
+- Safe write mode requires a trusted Grok project and refuses project-level
+  permission rules that could silently auto-approve tools.
+- Child processes receive a minimal environment. `XAI_API_KEY` is forwarded
+  only with the explicit environment opt-in above; normal logged-in sessions
+  do not need it.
 - Concurrent writers must use separate Git worktrees.
 - Official bridge updates must come from the expected xAI origin, stay on main,
-  and fast-forward cleanly.
+  remain clean and traceable to `origin/main`, and fast-forward cleanly.
 - Codex remains responsible for verifying material claims, diffs, and tests.
 - Multiple model answers are correlated samples, not independent proof.
 
@@ -129,7 +138,8 @@ Optional environment variables:
 - A terminal completed status does not guarantee a complete answer.
 - High parent-session concurrency may cause cancellations or quota pressure.
 - Automatic upstream updates can expose compatibility changes; the adapter
-  validates origin and capabilities but cannot guarantee future APIs.
+  deliberately follows xAI's `main` branch for timely updates, validates the
+  checkout before every execution, but cannot guarantee future APIs.
 
 ## Development
 

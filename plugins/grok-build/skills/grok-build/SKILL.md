@@ -45,7 +45,8 @@ reasoning levels.
 
 Continue with verified local versions if only a network update check fails.
 Stop and report the exact error if Grok is absent, unauthenticated, or the local
-runtime is invalid.
+runtime is invalid. A dirty, detached, divergent, or unexpected bridge checkout
+is invalid and must fail closed.
 
 Do not hardcode a model or effort in normal calls. The adapter chooses the
 highest numeric stable flagship returned by grok models and the highest effort
@@ -95,11 +96,18 @@ node $adapter review --no-sync --wait --cwd $repo --scope working-tree
 node $adapter critique --no-sync --wait --cwd $repo --scope working-tree 'Challenge correctness, security, regressions, and missing tests.'
 ~~~
 
-Bounded implementation:
+Bounded implementation uses direct mode so the adapter can enforce the
+workspace sandbox. It does not auto-approve every tool call:
 
 ~~~powershell
-node $adapter run --no-sync --write --fresh --cwd $repo 'Implement only the specified bounded change. Run relevant tests and summarize the diff.'
+node $adapter direct --no-sync --write --cwd $repo -p 'Implement only the specified bounded change. Run relevant tests and summarize the diff.'
 ~~~
+
+Only when the user separately authorizes unattended tool approval may you add
+`--unsafe-always-approve`. `run --write` is intentionally rejected because the
+official bridge currently turns it into unrestricted automatic approval. Safe
+write mode also refuses untrusted projects and project-level permission rules;
+do not bypass that check without the same separate authorization.
 
 Grok leader with three real read-only subagents:
 
