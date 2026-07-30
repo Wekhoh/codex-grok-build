@@ -1,6 +1,6 @@
 {
   "name": "codex-grok-build",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "A Codex plugin for orchestrating xAI Grok Build as an independent coding collaborator.",

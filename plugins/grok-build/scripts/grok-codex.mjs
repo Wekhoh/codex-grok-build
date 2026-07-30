@@ -6,18 +6,72 @@ import path from "node:path";
 import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 
+import {
+  assertCleanBridge,
+  assertSafeProjectPolicy,
+  buildDirectSafetyArgs,
+  createChildEnvironment,
+  hasOption,
+  isVerifiedStableCli,
+  resolveCommandCapabilities,
+  resolveTrustedExecutable,
+  singleOptionValue,
+  shouldInstallStable
+} from "./lib/runtime-policy.mjs";
+
 const OFFICIAL_REPOSITORY = "https://github.com/xai-org/grok-build-plugin-cc.git";
-const GROK_BINARY = process.env.GROK_BINARY || "grok";
+const GROK_BINARY_REQUEST = process.env.GROK_BINARY || "grok";
 const VENDOR_REPOSITORY = process.env.GROK_BUILD_REPOSITORY ||
   path.join(os.homedir(), ".codex", "vendor", "grok-build-plugin-cc");
 const BRIDGE_ROOT = path.join(VENDOR_REPOSITORY, "plugins", "grok-build");
 const BRIDGE_SCRIPT = path.join(BRIDGE_ROOT, "scripts", "grok-bridge.mjs");
 const PLUGIN_DATA_ROOT = process.env.GROK_BUILD_PLUGIN_DATA ||
   path.join(os.homedir(), ".codex", "plugin-data", "grok-build");
+const CLI_VERIFICATION_FILE = path.join(
+  PLUGIN_DATA_ROOT,
+  "cli-verification.json"
+);
 const PROXY_COMMANDS = new Set(["run", "review", "critique"]);
 const STATE_COMMANDS = new Set(["runs", "show", "stop", "import"]);
+const requestedTimeout = Number.parseInt(
+  process.env.GROK_BUILD_COMMAND_TIMEOUT_MS || "120000",
+  10
+);
+const COMMAND_TIMEOUT_MS = Number.isSafeInteger(requestedTimeout) &&
+  requestedTimeout > 0
+  ? requestedTimeout
+  : 120000;
+
+let resolvedGitBinary = null;
+let resolvedGrokBinary = null;
 
 class UpdatePolicyError extends Error {}
+
+function gitBinary() {
+  resolvedGitBinary ||= resolveTrustedExecutable("git");
+  return resolvedGitBinary;
+}
+
+function grokBinary() {
+  if (process.env.GROK_BINARY && !path.isAbsolute(process.env.GROK_BINARY)) {
+    throw new Error("GROK_BINARY must be an absolute executable path.");
+  }
+  resolvedGrokBinary ||= resolveTrustedExecutable(GROK_BINARY_REQUEST);
+  return resolvedGrokBinary;
+}
+
+function childEnvironment(extra = {}) {
+  return {
+    ...createChildEnvironment(process.env, {
+      forwardXaiApiKey:
+        process.env.GROK_BUILD_FORWARD_XAI_API_KEY === "1"
+    }),
+    ...(process.platform === "win32"
+      ? { NoDefaultCurrentDirectoryInExePath: "1" }
+      : {}),
+    ...extra
+  };
+}
 
 function fail(message, code = 1) {
   process.stderr.write(String(message) + "\n");
@@ -27,10 +81,11 @@ function fail(message, code = 1) {
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd || process.cwd(),
-    env: options.env || process.env,
+    env: options.env || childEnvironment(),
     encoding: "utf8",
     windowsHide: true,
-    maxBuffer: 16 * 1024 * 1024
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: options.timeout ?? COMMAND_TIMEOUT_MS
   });
   return {
     status: result.status ?? (result.error || result.signal ? 1 : 0),
@@ -106,7 +161,7 @@ function takeSwitch(args, name) {
 function ensureVendorRepository() {
   if (!fs.existsSync(VENDOR_REPOSITORY)) {
     fs.mkdirSync(path.dirname(VENDOR_REPOSITORY), { recursive: true });
-    checked("git", [
+    checked(gitBinary(), [
       "clone",
       "--filter=blob:none",
       OFFICIAL_REPOSITORY,
@@ -114,7 +169,7 @@ function ensureVendorRepository() {
     ]);
   }
 
-  const remote = checked("git", [
+  const remote = checked(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "remote",
@@ -125,7 +180,8 @@ function ensureVendorRepository() {
   const expected = OFFICIAL_REPOSITORY.replace(/\.git$/, "").toLowerCase();
   if (normalized !== expected) {
     throw new UpdatePolicyError(
-      "Refusing to update unexpected Grok bridge origin: " + remote
+      "Refusing to update unexpected Grok bridge origin: " +
+      redactRemote(remote)
     );
   }
   if (!fs.existsSync(BRIDGE_SCRIPT)) {
@@ -135,30 +191,36 @@ function ensureVendorRepository() {
   }
 }
 
-function syncBridge() {
+function redactRemote(remote) {
+  try {
+    const parsed = new URL(remote);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return "<non-standard remote>";
+  }
+}
+
+function verifyBridgeCheckout() {
   ensureVendorRepository();
-  const before = checked("git", [
+  const head = checked(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "rev-parse",
     "HEAD"
   ]);
-  const dirty = checked("git", [
+  const dirty = checked(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "status",
     "--porcelain"
   ]);
-  if (dirty) {
-    return {
-      before,
-      after: before,
-      updated: false,
-      skipped: "working tree is not clean"
-    };
-  }
+  assertCleanBridge(dirty, UpdatePolicyError);
 
-  const branch = checked("git", [
+  const branchResult = run(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "symbolic-ref",
@@ -166,6 +228,9 @@ function syncBridge() {
     "-q",
     "HEAD"
   ]);
+  const branch = branchResult.status === 0
+    ? branchResult.stdout.trim()
+    : "";
   if (branch !== "main") {
     throw new UpdatePolicyError(
       "Refusing to update Grok bridge from branch " +
@@ -174,20 +239,46 @@ function syncBridge() {
     );
   }
 
-  checked("git", [
+  const remoteHead = checked(gitBinary(), [
+    "-C",
+    VENDOR_REPOSITORY,
+    "rev-parse",
+    "origin/main"
+  ]);
+  const ancestry = run(gitBinary(), [
+    "-C",
+    VENDOR_REPOSITORY,
+    "merge-base",
+    "--is-ancestor",
+    head,
+    remoteHead
+  ]);
+  if (ancestry.status !== 0) {
+    throw new UpdatePolicyError(
+      "Official Grok bridge HEAD is not a verified ancestor of origin/main."
+    );
+  }
+  return { head, branch, remoteHead };
+}
+
+function syncBridge() {
+  const verified = verifyBridgeCheckout();
+  const before = verified.head;
+
+  checked(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "fetch",
     "--prune",
     "origin"
   ]);
-  const remoteHead = checked("git", [
+  const remoteHead = checked(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "rev-parse",
     "origin/main"
   ]);
-  const ancestry = run("git", [
+  const ancestry = run(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "merge-base",
@@ -201,7 +292,7 @@ function syncBridge() {
     );
   }
   if (before !== remoteHead) {
-    checked("git", [
+    checked(gitBinary(), [
       "-C",
       VENDOR_REPOSITORY,
       "merge",
@@ -209,12 +300,7 @@ function syncBridge() {
       remoteHead
     ]);
   }
-  const after = checked("git", [
-    "-C",
-    VENDOR_REPOSITORY,
-    "rev-parse",
-    "HEAD"
-  ]);
+  const after = verifyBridgeCheckout().head;
   return {
     before,
     after,
@@ -224,16 +310,61 @@ function syncBridge() {
 }
 
 function syncCli() {
-  const check = parseJsonOutput(
-    checked(GROK_BINARY, ["update", "--check", "--json"])
+  let check = parseJsonOutput(
+    checked(grokBinary(), ["update", "--check", "--json"])
   );
   let installed = false;
-  if (check.updateAvailable) {
-    checked(GROK_BINARY, ["update", "--stable"]);
+  if (shouldInstallStable(check)) {
+    try {
+      checked(grokBinary(), ["update", "--stable"]);
+    } catch (error) {
+      if (check.channel !== "stable") {
+        throw new UpdatePolicyError(
+          "Could not switch Grok CLI to the stable channel: " + error.message
+        );
+      }
+      throw error;
+    }
     installed = true;
+    check = parseJsonOutput(
+      checked(grokBinary(), ["update", "--check", "--json"])
+    );
   }
-  const version = checked(GROK_BINARY, ["--version"]);
+  if (check.channel !== "stable") {
+    throw new UpdatePolicyError(
+      "Grok CLI did not report the stable update channel."
+    );
+  }
+  const version = checked(grokBinary(), ["--version"]);
+  fs.mkdirSync(PLUGIN_DATA_ROOT, { recursive: true });
+  fs.writeFileSync(
+    CLI_VERIFICATION_FILE,
+    JSON.stringify({ channel: "stable", version }, null, 2) + "\n",
+    "utf8"
+  );
   return { ...check, installed, version };
+}
+
+function verifiedOfflineCli(updateError) {
+  const version = checked(grokBinary(), ["--version"]);
+  let record = null;
+  try {
+    record = JSON.parse(fs.readFileSync(CLI_VERIFICATION_FILE, "utf8"));
+  } catch {
+    // A missing or unreadable record is not verified local state.
+  }
+  if (!isVerifiedStableCli(record, version)) {
+    throw new UpdatePolicyError(
+      "CLI update check failed and the installed Grok version has no " +
+      "matching stable-channel verification record: " + updateError.message
+    );
+  }
+  return {
+    channel: "stable",
+    installed: false,
+    offline: true,
+    version
+  };
 }
 
 function parseModels(output) {
@@ -304,7 +435,6 @@ function chooseModel(modelInfo, override = null) {
 }
 
 function bridgeEfforts() {
-  ensureVendorRepository();
   const source = fs.readFileSync(BRIDGE_SCRIPT, "utf8");
   const match = source.match(
     /VALID_REASONING_EFFORTS\s*=\s*new Set\(\[([^\]]+)\]\)/s
@@ -318,9 +448,9 @@ function bridgeEfforts() {
 }
 
 function getCapabilities(overrides = {}) {
-  ensureVendorRepository();
-  const version = checked(GROK_BINARY, ["--version"]);
-  const modelOutput = checked(GROK_BINARY, ["models"]);
+  verifyBridgeCheckout();
+  const version = checked(grokBinary(), ["--version"]);
+  const modelOutput = checked(grokBinary(), ["models"]);
   const modelInfo = parseModels(modelOutput);
   const efforts = bridgeEfforts();
   const model = chooseModel(
@@ -341,7 +471,7 @@ function getCapabilities(overrides = {}) {
   if (!model) {
     throw new Error("No Grok model is available.");
   }
-  const bridgeCommit = checked("git", [
+  const bridgeCommit = checked(gitBinary(), [
     "-C",
     VENDOR_REPOSITORY,
     "rev-parse",
@@ -361,7 +491,7 @@ function getCapabilities(overrides = {}) {
   };
 }
 
-function syncAll() {
+function syncAll(overrides = {}) {
   const result = {
     ready: false,
     cli: null,
@@ -371,36 +501,35 @@ function syncAll() {
   try {
     result.cli = syncCli();
   } catch (error) {
+    if (error instanceof UpdatePolicyError) {
+      throw error;
+    }
+    result.cli = verifiedOfflineCli(error);
     result.warnings.push("CLI update check failed: " + error.message);
   }
   try {
     result.bridge = syncBridge();
-    if (result.bridge.skipped) {
-      result.warnings.push(
-        "Bridge update skipped: " + result.bridge.skipped
-      );
-    }
   } catch (error) {
     if (error instanceof UpdatePolicyError) {
       throw error;
     }
     result.warnings.push("Bridge update check failed: " + error.message);
   }
-  const capabilities = getCapabilities();
+  const capabilities = getCapabilities(overrides);
   result.ready = capabilities.ready;
   result.capabilities = capabilities;
   return result;
 }
 
-function syncForCommand() {
-  const result = syncAll();
+function syncForCommand(overrides = {}) {
+  const result = syncAll(overrides);
   for (const warning of result.warnings) {
     process.stderr.write("[grok-build] warning: " + warning + "\n");
   }
   return result;
 }
 
-function passthrough(command, args, env = process.env) {
+function passthrough(command, args, env = childEnvironment()) {
   const child = spawn(command, args, {
     cwd: process.cwd(),
     env,
@@ -413,13 +542,25 @@ function passthrough(command, args, env = process.env) {
 
 function bridgeEnvironment() {
   fs.mkdirSync(PLUGIN_DATA_ROOT, { recursive: true });
-  return {
-    ...process.env,
+  return childEnvironment({
+    GROK_BINARY: grokBinary(),
     PLUGIN_ROOT: BRIDGE_ROOT,
     PLUGIN_DATA: PLUGIN_DATA_ROOT,
     CLAUDE_PLUGIN_ROOT: BRIDGE_ROOT,
     CLAUDE_PLUGIN_DATA: PLUGIN_DATA_ROOT
-  };
+  });
+}
+
+function verifySafeWriteProject(args, unsafeAlwaysApprove) {
+  if (unsafeAlwaysApprove) {
+    return;
+  }
+  const requestedCwd = singleOptionValue(args, "cwd");
+  const targetCwd = path.resolve(requestedCwd || process.cwd());
+  const inspect = parseJsonOutput(
+    checked(grokBinary(), ["--cwd", targetCwd, "inspect", "--json"])
+  );
+  assertSafeProjectPolicy(inspect);
 }
 
 function printUsage() {
@@ -430,7 +571,7 @@ function printUsage() {
     "  grok-codex.mjs check [--no-sync] [--json]",
     "  grok-codex.mjs run|review|critique [--no-sync] [bridge options]",
     "  grok-codex.mjs runs|show|stop|import [bridge options]",
-    "  grok-codex.mjs direct [--no-sync] [--write] [native grok options]",
+    "  grok-codex.mjs direct [--no-sync] [--write] [--unsafe-always-approve] [native grok options]",
     "",
     "Defaults are selected from grok models and the official bridge effort list.",
     "Set GROK_MODEL or GROK_REASONING_EFFORT for an explicit override.",
@@ -456,26 +597,30 @@ async function main() {
   }
 
   if (command === "capabilities") {
-    if (!noSync) {
-      syncForCommand();
-    }
     const model = takeOption(args, "model");
     const effort = takeOption(args, "effort");
     if (args.length > 0) {
       throw new Error("Unknown capabilities arguments: " + args.join(" "));
     }
-    const result = getCapabilities({ model, effort });
+    const result = resolveCommandCapabilities({
+      noSync,
+      overrides: { model, effort },
+      sync: syncForCommand,
+      probe: getCapabilities
+    });
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
     return;
   }
 
   if (command === "check") {
-    if (!noSync) {
-      syncForCommand();
-    }
-    const capabilities = getCapabilities();
+    const capabilities = resolveCommandCapabilities({
+      noSync,
+      overrides: {},
+      sync: syncForCommand,
+      probe: getCapabilities
+    });
     const bridgeCheck = run(
-      "node",
+      process.execPath,
       [BRIDGE_SCRIPT, "check", "--json"],
       { env: bridgeEnvironment() }
     );
@@ -491,14 +636,22 @@ async function main() {
   }
 
   if (PROXY_COMMANDS.has(command)) {
-    if (!noSync) {
-      syncForCommand();
+    if (command === "run" && hasOption(args, "write")) {
+      throw new Error(
+        "The official bridge write mode auto-approves tools. " +
+        "Use direct --write for workspace-bounded implementation."
+      );
     }
     const explicitModel = takeOption(args, "model");
     const explicitEffort = takeOption(args, "effort");
-    const capabilities = getCapabilities({
-      model: explicitModel,
-      effort: explicitEffort
+    const capabilities = resolveCommandCapabilities({
+      noSync,
+      overrides: {
+        model: explicitModel,
+        effort: explicitEffort
+      },
+      sync: syncForCommand,
+      probe: getCapabilities
     });
     process.stderr.write(
       "[grok-build] model=" +
@@ -512,7 +665,7 @@ async function main() {
       "\n"
     );
     passthrough(
-      "node",
+      process.execPath,
       [
         BRIDGE_SCRIPT,
         command,
@@ -529,9 +682,9 @@ async function main() {
   }
 
   if (STATE_COMMANDS.has(command)) {
-    ensureVendorRepository();
+    verifyBridgeCheckout();
     passthrough(
-      "node",
+      process.execPath,
       [
         BRIDGE_SCRIPT,
         command,
@@ -544,38 +697,33 @@ async function main() {
   }
 
   if (command === "direct") {
-    if (!noSync) {
-      syncForCommand();
-    }
     const write = takeSwitch(args, "write");
+    const unsafeAlwaysApprove = takeSwitch(args, "unsafe-always-approve");
     const explicitModel = takeOption(args, "model");
     const explicitEffort = takeOption(args, "effort");
-    const capabilities = getCapabilities({
-      model: explicitModel,
-      effort: explicitEffort
+    const safetyArgs = buildDirectSafetyArgs(args, {
+      write,
+      unsafeAlwaysApprove
     });
-    const hasPermission = args.some(
-      (arg) =>
-        arg === "--permission-mode" ||
-        arg.startsWith("--permission-mode=")
-    );
-    const hasSandbox = args.some(
-      (arg) => arg === "--sandbox" || arg.startsWith("--sandbox=")
-    );
+    if (write) {
+      verifySafeWriteProject(args, unsafeAlwaysApprove);
+    }
+    const capabilities = resolveCommandCapabilities({
+      noSync,
+      overrides: {
+        model: explicitModel,
+        effort: explicitEffort
+      },
+      sync: syncForCommand,
+      probe: getCapabilities
+    });
     const nativeArgs = [
       "--model",
       capabilities.selectedModel,
       "--reasoning-effort",
       capabilities.selectedReasoningEffort,
-      ...(!write && !hasPermission
-        ? ["--permission-mode", "plan"]
-        : []),
-      ...(!write && !hasSandbox
-        ? ["--sandbox", "read-only"]
-        : []),
-      ...(write && !args.includes("--always-approve")
-        ? ["--always-approve"]
-        : []),
+      "--no-auto-update",
+      ...safetyArgs,
       ...(asJson ? ["--output-format", "json"] : []),
       ...args
     ];
@@ -590,7 +738,7 @@ async function main() {
       capabilities.bridgeCommit.slice(0, 12) +
       "\n"
     );
-    passthrough(GROK_BINARY, nativeArgs);
+    passthrough(grokBinary(), nativeArgs);
     return;
   }
 
