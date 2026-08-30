@@ -1,6 +1,6 @@
 {
   "name": "grok-build",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Use xAI Grok Build from Codex for independent review, debate, verification, delegation, and parallel agent work.",
   "author": {
     "name": "Wekhoh",
@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "Grok Build for Codex",
     "shortDescription": "Orchestrate Grok for review, debate, verification, and delegation",
-    "longDescription": "Use the official Grok CLI and xAI bridge from Codex for independent consultation, adversarial review, evidence-based verification, design debate, parallel research, and bounded implementation delegation. Dynamically selects the highest available stable model and reasoning effort.",
+    "longDescription": "Use the official Grok CLI and xAI bridge from Codex for independent consultation, adversarial review, evidence-based verification, design debate, parallel research, and bounded implementation delegation. Dynamically selects the highest available stable model and that model's highest advertised reasoning effort, including Grok 4.6 xhigh when available.",
     "developerName": "Wekhoh",
     "category": "Productivity",
     "capabilities": [

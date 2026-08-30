@@ -10,6 +10,7 @@ import {
   assertSafeProjectPolicy,
   buildDirectSafetyArgs,
   createChildEnvironment,
+  extractCapabilityOverrides,
   hasOption,
   isVerifiedStableCli,
   resolveCommandCapabilities,
@@ -59,7 +60,12 @@ test("plugin manifest and marketplace agree", () => {
   assert.equal(entry.source.path, "./plugins/grok-build");
   assert.equal(entry.policy.installation, "AVAILABLE");
   assert.equal(entry.policy.authentication, "ON_INSTALL");
-  assert.equal(manifest.version, readJson(path.join(root, "package.json")).version);
+  const packageJson = readJson(path.join(root, "package.json"));
+  assert.equal(manifest.version, packageJson.version);
+  assert.equal(
+    packageJson.scripts.test,
+    "node --test tests/bridge-snapshot.test.mjs tests/model-capabilities.test.mjs tests/package.test.mjs"
+  );
 });
 
 test("bundled paths exist and stay inside the plugin", () => {
@@ -169,6 +175,7 @@ test("child environment drops unrelated credentials by default", () => {
     PATH: [".", absoluteBin].join(path.delimiter),
     SystemRoot: "C:\\Windows",
     USERPROFILE: "C:\\Users\\demo",
+    GROK_HOME: "C:\\Users\\demo\\custom-grok-home",
     GITHUB_TOKEN: "github-secret",
     AWS_SECRET_ACCESS_KEY: "aws-secret",
     XAI_API_KEY: "xai-secret"
@@ -177,6 +184,7 @@ test("child environment drops unrelated credentials by default", () => {
   const safe = createChildEnvironment(source);
   assert.equal(safe.PATH, absoluteBin);
   assert.equal(safe.SystemRoot, "C:\\Windows");
+  assert.equal(safe.GROK_HOME, "C:\\Users\\demo\\custom-grok-home");
   assert.equal(safe.GITHUB_TOKEN, undefined);
   assert.equal(safe.AWS_SECRET_ACCESS_KEY, undefined);
   assert.equal(safe.XAI_API_KEY, undefined);
@@ -386,6 +394,62 @@ test("sync capability resolution honors explicit overrides exactly once", () => 
 
   assert.equal(result.selectedModel, "grok-4.5");
   assert.deepEqual(calls, [["sync", overrides]]);
+});
+
+test("capability overrides reject duplicate aliases before child argv", () => {
+  const proxyArgs = [
+    "--model=grok-4.6",
+    "--effort",
+    "xhigh",
+    "--wait",
+    "Inspect this change."
+  ];
+  assert.deepEqual(extractCapabilityOverrides(proxyArgs), {
+    model: "grok-4.6",
+    effort: "xhigh",
+    args: ["--wait", "Inspect this change."]
+  });
+  assert.deepEqual(
+    extractCapabilityOverrides(["-m", "grok-4.5", "Inspect this change."]),
+    {
+      model: "grok-4.5",
+      effort: null,
+      args: ["Inspect this change."]
+    }
+  );
+
+  const directArgs = [
+    "-m",
+    "grok-4.6",
+    "--reasoning-effort=medium",
+    "-p",
+    "Return a result."
+  ];
+  assert.deepEqual(extractCapabilityOverrides(directArgs, { direct: true }), {
+    model: "grok-4.6",
+    effort: "medium",
+    args: ["-p", "Return a result."]
+  });
+
+  for (const args of [
+    ["--model", "grok-4.6", "--model=grok-4.5"],
+    ["--effort", "xhigh", "--reasoning-effort", "high"],
+    ["-mgrok-4.6", "-m", "grok-4.5"],
+    ["-rxhigh", "--effort=high"]
+  ]) {
+    assert.throws(
+      () => extractCapabilityOverrides(args, { direct: true }),
+      /at most once/
+    );
+  }
+  assert.throws(
+    () => extractCapabilityOverrides([
+      "--model",
+      "grok-4.6",
+      "-mgrok-4.5"
+    ]),
+    /at most once/
+  );
 });
 
 test("GitHub Actions are pinned to immutable commits", () => {
