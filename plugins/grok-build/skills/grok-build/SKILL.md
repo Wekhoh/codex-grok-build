@@ -40,8 +40,8 @@ node $adapter capabilities --no-sync --json
 
 Run sync once before the first Grok call in a user workflow. It checks and
 installs a newer stable Grok CLI, fast-forwards the xAI official bridge
-checkout, refreshes available models, and discovers the bridge-supported
-reasoning levels.
+checkout, refreshes available models, and discovers each model's reasoning
+levels from the version-matched Grok CLI catalog.
 
 Continue with verified local versions if only a network update check fails.
 Stop and report the exact error if Grok is absent, unauthenticated, or the local
@@ -50,7 +50,10 @@ is invalid and must fail closed.
 
 Do not hardcode a model or effort in normal calls. The adapter chooses the
 highest numeric stable flagship returned by grok models and the highest effort
-exposed by the current official bridge. Explicit user overrides still win.
+advertised for that selected model. If the official bridge has not yet added a
+valid model effort such as Grok 4.6 `xhigh`, the adapter uses a verified local
+compatibility overlay without modifying the official checkout. Explicit user
+overrides still win, and unsupported model/effort combinations fail closed.
 Report the actual CLI version, bridge commit, model, and effort in the handoff.
 
 ## Choose a collaboration pattern

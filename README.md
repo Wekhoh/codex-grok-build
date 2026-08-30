@@ -16,7 +16,8 @@ keeps that official bridge as the execution foundation and adds:
 - Codex plugin packaging and skill discovery
 - Stable-channel CLI updates and verified official-bridge synchronization
 - Dynamic selection of the highest available stable flagship model
-- Dynamic selection of the highest reasoning effort exposed by the bridge
+- Model-specific reasoning discovery from the installed Grok CLI catalog
+- Grok 4.6 `xhigh` support through a verified local bridge overlay
 - Direct Grok CLI access for native subagent workflows
 - Collaboration patterns for debate, verification, and parallel review
 - Output-quality gates: process completion is not treated as answer acceptance
@@ -93,8 +94,21 @@ direct
 ~~~
 
 The adapter normally synchronizes before work. Pass --no-sync when a workflow
-already synchronized once. Set GROK_MODEL or GROK_REASONING_EFFORT only when an
-explicit override is required.
+already synchronized once. It chooses the highest numeric model reported by
+`grok models` and that model's highest advertised reasoning effort. With Grok
+CLI 1.0.13, for example, Grok 4.6 exposes `xhigh`, `high`, `medium`, and `low`,
+while Grok 4.5 exposes `high`, `medium`, and `low`. Set `GROK_MODEL` or
+`GROK_REASONING_EFFORT` only when an explicit override is required.
+
+The adapter runs proxy commands from a content-addressed snapshot containing
+only files tracked by the pinned official bridge commit. When the selected
+effort is valid for the model but absent from the bridge whitelist, it patches
+only the snapshot copy. It verifies the complete snapshot against the official
+tracked tree plus the expected patch before running it; ignored local files
+cannot enter the runtime, and the vendor checkout remains untouched. If the
+CLI catalog is missing or does not match the running CLI version, the adapter
+falls back to the official bridge's advertised levels and prints a warning
+rather than guessing.
 
 The import command is a low-level pass-through to xAI's Claude-oriented bridge.
 It does not automatically discover or import the current Codex transcript; pass
@@ -109,8 +123,10 @@ Optional environment variables:
 | GROK_BUILD_PLUGIN_DATA | Override the writable run-state directory |
 | GROK_BUILD_COMMAND_TIMEOUT_MS | Bound update and capability probes (default 120000) |
 | GROK_BUILD_FORWARD_XAI_API_KEY | Set to 1 only when API-key auth must be forwarded |
+| GROK_HOME | Override the Grok CLI configuration and model-catalog directory |
+| GROK_MODEL_CACHE_FILE | Override the model catalog with an absolute file path |
 | GROK_MODEL | Pin an available model |
-| GROK_REASONING_EFFORT | Pin a bridge-supported reasoning level |
+| GROK_REASONING_EFFORT | Pin a reasoning level supported by the selected model |
 
 ## Safety model
 
@@ -126,6 +142,9 @@ Optional environment variables:
 - Concurrent writers must use separate Git worktrees.
 - Official bridge updates must come from the expected xAI origin, stay on main,
   remain clean and traceable to `origin/main`, and fast-forward cleanly.
+- Runtime snapshots and compatibility overlays contain only pinned tracked
+  files, are content-addressed and verified, and never alter or masquerade as
+  the official bridge checkout.
 - Codex remains responsible for verifying material claims, diffs, and tests.
 - Multiple model answers are correlated samples, not independent proof.
 

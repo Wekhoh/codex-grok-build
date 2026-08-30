@@ -9,6 +9,7 @@ const CHILD_ENVIRONMENT_KEYS = new Set([
   "COMMONPROGRAMFILES(X86)",
   "COMSPEC",
   "FORCE_COLOR",
+  "GROK_HOME",
   "HOME",
   "LANG",
   "LC_ALL",
@@ -200,6 +201,81 @@ export function singleOptionValue(args, name) {
     throw new Error("--" + name + " may be provided at most once.");
   }
   return values[0] ?? null;
+}
+
+function setCapabilityOverride(result, key, value, label) {
+  if (result[key] != null) {
+    throw new Error(label + " may be provided at most once across aliases.");
+  }
+  if (value == null || value === "") {
+    throw new Error(label + " requires a value.");
+  }
+  result[key] = value;
+}
+
+export function extractCapabilityOverrides(inputArgs, options = {}) {
+  const result = { model: null, effort: null, args: [] };
+  const longOptions = new Map([
+    ["--model", ["model", "--model"]],
+    ["--effort", ["effort", "--effort"]],
+    ...(options.direct
+      ? [["--reasoning-effort", ["effort", "--effort"]]]
+      : [])
+  ]);
+  const shortOptions = new Map([
+    ["-m", ["model", "--model"]],
+    ...(options.direct ? [["-r", ["effort", "--effort"]]] : [])
+  ]);
+
+  for (let index = 0; index < inputArgs.length; index += 1) {
+    const argument = inputArgs[index];
+    let consumed = false;
+
+    for (const [option, [key, label]] of longOptions) {
+      if (argument === option) {
+        if (index + 1 >= inputArgs.length) {
+          throw new Error(option + " requires a value.");
+        }
+        setCapabilityOverride(result, key, inputArgs[index + 1], label);
+        index += 1;
+        consumed = true;
+        break;
+      }
+      if (argument.startsWith(option + "=")) {
+        setCapabilityOverride(
+          result,
+          key,
+          argument.slice(option.length + 1),
+          label
+        );
+        consumed = true;
+        break;
+      }
+    }
+    if (consumed) continue;
+
+    for (const [option, [key, label]] of shortOptions) {
+      if (argument === option) {
+        if (index + 1 >= inputArgs.length) {
+          throw new Error(option + " requires a value.");
+        }
+        setCapabilityOverride(result, key, inputArgs[index + 1], label);
+        index += 1;
+        consumed = true;
+        break;
+      }
+      if (argument.startsWith(option + "=") || argument.startsWith(option)) {
+        const offset = argument.startsWith(option + "=")
+          ? option.length + 1
+          : option.length;
+        setCapabilityOverride(result, key, argument.slice(offset), label);
+        consumed = true;
+        break;
+      }
+    }
+    if (!consumed) result.args.push(argument);
+  }
+  return result;
 }
 
 export function hasOption(args, name) {

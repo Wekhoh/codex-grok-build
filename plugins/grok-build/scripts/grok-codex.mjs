@@ -7,10 +7,16 @@ import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 
 import {
+  digestTrackedTree,
+  materializeTrackedSnapshot,
+  parseTrackedTree
+} from "./lib/bridge-snapshot.mjs";
+import {
   assertCleanBridge,
   assertSafeProjectPolicy,
   buildDirectSafetyArgs,
   createChildEnvironment,
+  extractCapabilityOverrides,
   hasOption,
   isVerifiedStableCli,
   resolveCommandCapabilities,
@@ -18,6 +24,15 @@ import {
   singleOptionValue,
   shouldInstallStable
 } from "./lib/runtime-policy.mjs";
+import {
+  buildModelCapabilityCatalog,
+  chooseModel,
+  chooseReasoningEffort,
+  parseBridgeReasoningEfforts,
+  parseModels,
+  patchBridgeReasoningEfforts,
+  unionReasoningEfforts
+} from "./lib/model-capabilities.mjs";
 
 const OFFICIAL_REPOSITORY = "https://github.com/xai-org/grok-build-plugin-cc.git";
 const GROK_BINARY_REQUEST = process.env.GROK_BINARY || "grok";
@@ -25,8 +40,13 @@ const VENDOR_REPOSITORY = process.env.GROK_BUILD_REPOSITORY ||
   path.join(os.homedir(), ".codex", "vendor", "grok-build-plugin-cc");
 const BRIDGE_ROOT = path.join(VENDOR_REPOSITORY, "plugins", "grok-build");
 const BRIDGE_SCRIPT = path.join(BRIDGE_ROOT, "scripts", "grok-bridge.mjs");
+const BRIDGE_GIT_ROOT = "plugins/grok-build";
 const PLUGIN_DATA_ROOT = process.env.GROK_BUILD_PLUGIN_DATA ||
   path.join(os.homedir(), ".codex", "plugin-data", "grok-build");
+const GROK_HOME = process.env.GROK_HOME || path.join(os.homedir(), ".grok");
+const MODEL_CACHE_FILE = process.env.GROK_MODEL_CACHE_FILE ||
+  path.join(GROK_HOME, "models_cache.json");
+const BRIDGE_RUNTIME_ROOT = path.join(PLUGIN_DATA_ROOT, "bridge-runtimes");
 const CLI_VERIFICATION_FILE = path.join(
   PLUGIN_DATA_ROOT,
   "cli-verification.json"
@@ -44,6 +64,7 @@ const COMMAND_TIMEOUT_MS = Number.isSafeInteger(requestedTimeout) &&
 
 let resolvedGitBinary = null;
 let resolvedGrokBinary = null;
+const bridgeBlobCache = new Map();
 
 class UpdatePolicyError extends Error {}
 
@@ -85,6 +106,7 @@ function run(command, args, options = {}) {
     encoding: "utf8",
     windowsHide: true,
     maxBuffer: 16 * 1024 * 1024,
+    input: options.input,
     timeout: options.timeout ?? COMMAND_TIMEOUT_MS
   });
   return {
@@ -94,6 +116,28 @@ function run(command, args, options = {}) {
     error: result.error || null,
     signal: result.signal || null
   };
+}
+
+function checkedBuffer(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: options.cwd || process.cwd(),
+    env: options.env || childEnvironment(),
+    encoding: null,
+    windowsHide: true,
+    maxBuffer: 16 * 1024 * 1024,
+    input: options.input,
+    timeout: options.timeout ?? COMMAND_TIMEOUT_MS
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = result.stderr?.toString("utf8") ||
+      result.stdout?.toString("utf8") ||
+      command + (result.signal
+        ? " terminated by " + result.signal
+        : " exited " + result.status);
+    throw new Error(detail.trim());
+  }
+  return Buffer.from(result.stdout || []);
 }
 
 function checked(command, args, options = {}) {
@@ -127,25 +171,6 @@ function parseJsonOutput(value) {
     }
   }
   throw new Error("Command did not return valid JSON.");
-}
-
-function takeOption(args, name) {
-  const exact = "--" + name;
-  const prefix = exact + "=";
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index];
-    if (value === exact) {
-      if (index + 1 >= args.length) {
-        throw new Error(exact + " requires a value.");
-      }
-      return args.splice(index, 2)[1];
-    }
-    if (value.startsWith(prefix)) {
-      args.splice(index, 1);
-      return value.slice(prefix.length);
-    }
-  }
-  return null;
 }
 
 function takeSwitch(args, name) {
@@ -367,128 +392,199 @@ function verifiedOfflineCli(updateError) {
   };
 }
 
-function parseModels(output) {
-  const models = [];
-  let defaultModel = null;
-  let inModels = false;
-  for (const rawLine of String(output).split(/\r?\n/)) {
-    const line = rawLine.trim();
-    const defaultMatch = line.match(/^Default model:\s*(\S+)/i);
-    if (defaultMatch) {
-      defaultModel = defaultMatch[1];
-      continue;
-    }
-    if (/^Available models:/i.test(line)) {
-      inModels = true;
-      continue;
-    }
-    if (!inModels || !line) {
-      continue;
-    }
-    const modelMatch = line.match(
-      /^(?:\*\s*)?([A-Za-z0-9][A-Za-z0-9._:-]*)(?:\s+\(default\))?$/
-    );
-    if (modelMatch) {
-      models.push(modelMatch[1]);
-      if (/\(default\)\s*$/.test(line)) {
-        defaultModel = modelMatch[1];
-      }
-    }
-  }
-  return {
-    defaultModel,
-    models: [...new Set(models)]
-  };
-}
-
-function numericModelParts(model) {
-  const match = String(model).match(/^grok-(\d+(?:\.\d+)*)$/i);
-  return match ? match[1].split(".").map(Number) : null;
-}
-
-function compareNumberArrays(left, right) {
-  const size = Math.max(left.length, right.length);
-  for (let index = 0; index < size; index += 1) {
-    const delta = (left[index] || 0) - (right[index] || 0);
-    if (delta !== 0) {
-      return delta;
-    }
-  }
-  return 0;
-}
-
-function chooseModel(modelInfo, override = null) {
-  if (override) {
-    if (modelInfo.models.length > 0 && !modelInfo.models.includes(override)) {
-      throw new Error("Requested model is not available: " + override);
-    }
-    return override;
-  }
-  const flagship = modelInfo.models
-    .map((model) => ({ model, parts: numericModelParts(model) }))
-    .filter((entry) => entry.parts)
-    .sort((left, right) => compareNumberArrays(right.parts, left.parts));
-  return flagship[0]?.model ||
-    modelInfo.defaultModel ||
-    modelInfo.models[0] ||
-    null;
-}
-
-function bridgeEfforts() {
-  const source = fs.readFileSync(BRIDGE_SCRIPT, "utf8");
-  const match = source.match(
-    /VALID_REASONING_EFFORTS\s*=\s*new Set\(\[([^\]]+)\]\)/s
-  );
-  if (!match) {
-    return ["high"];
-  }
-  const efforts = [...match[1].matchAll(/["']([^"']+)["']/g)]
-    .map((item) => item[1]);
+function bridgeEfforts(source) {
+  const efforts = parseBridgeReasoningEfforts(source);
   return efforts.length > 0 ? efforts : ["high"];
 }
 
+function loadModelCache() {
+  if (process.env.GROK_MODEL_CACHE_FILE && !path.isAbsolute(MODEL_CACHE_FILE)) {
+    throw new Error("GROK_MODEL_CACHE_FILE must be an absolute path.");
+  }
+  try {
+    return {
+      cache: JSON.parse(fs.readFileSync(MODEL_CACHE_FILE, "utf8")),
+      warning: null
+    };
+  } catch (error) {
+    return {
+      cache: null,
+      warning: "Grok model cache could not be read: " + error.message
+    };
+  }
+}
+
+function trackedBridgeEntries(commit) {
+  const output = checked(gitBinary(), [
+    "-C",
+    VENDOR_REPOSITORY,
+    "ls-tree",
+    "-r",
+    "-z",
+    commit,
+    "--",
+    BRIDGE_GIT_ROOT
+  ]);
+  const entries = parseTrackedTree(output, BRIDGE_GIT_ROOT);
+  if (!entries.some((entry) => entry.relative === "scripts/grok-bridge.mjs")) {
+    throw new UpdatePolicyError(
+      "The pinned official bridge commit does not contain grok-bridge.mjs."
+    );
+  }
+  return entries;
+}
+
+function bridgeBlobContent(entry) {
+  if (bridgeBlobCache.has(entry.object)) {
+    return bridgeBlobCache.get(entry.object);
+  }
+  const content = checkedBuffer(gitBinary(), [
+    "-C",
+    VENDOR_REPOSITORY,
+    "cat-file",
+    "blob",
+    entry.object
+  ]);
+  const actualObject = checked(gitBinary(), [
+    "-C",
+    VENDOR_REPOSITORY,
+    "hash-object",
+    "--stdin"
+  ], { input: content });
+  if (actualObject.toLowerCase() !== entry.object.toLowerCase()) {
+    throw new UpdatePolicyError(
+      "Official Grok bridge blob failed object-hash verification: " +
+      entry.relative
+    );
+  }
+  bridgeBlobCache.set(entry.object, content);
+  return content;
+}
+
+function bridgeScriptEntry(entries) {
+  const entry = entries.find(
+    (candidate) => candidate.relative === "scripts/grok-bridge.mjs"
+  );
+  if (!entry) {
+    throw new UpdatePolicyError(
+      "The pinned official bridge commit does not contain grok-bridge.mjs."
+    );
+  }
+  return entry;
+}
+
+function assertBridgeCommit(expected) {
+  const verified = verifyBridgeCheckout();
+  if (verified.head !== expected) {
+    throw new UpdatePolicyError(
+      "Official Grok bridge changed during capability resolution; retry the command."
+    );
+  }
+}
+
+function bridgeRuntime(capabilities) {
+  assertBridgeCommit(capabilities.bridgeCommit);
+  const entries = trackedBridgeEntries(capabilities.bridgeCommit);
+  const officialSource = bridgeBlobContent(bridgeScriptEntry(entries))
+    .toString("utf8");
+  const needsCompatibilityOverlay = !capabilities.bridgeNativeReasoningEfforts.includes(
+    capabilities.selectedReasoningEffort
+  );
+  const relativeScript = "scripts/grok-bridge.mjs";
+  const runtimeSource = needsCompatibilityOverlay
+    ? patchBridgeReasoningEfforts(
+      officialSource,
+      capabilities.pluginSupportedReasoningEfforts
+    )
+    : officialSource;
+  const overrides = new Map([
+    [relativeScript, Buffer.from(runtimeSource, "utf8")]
+  ]);
+  const expectedDigest = digestTrackedTree(
+    entries,
+    bridgeBlobContent,
+    overrides
+  );
+  const key = capabilities.bridgeCommit + "-" + expectedDigest.slice(0, 24);
+  const runtimeRoot = path.join(BRIDGE_RUNTIME_ROOT, key);
+  materializeTrackedSnapshot({
+    entries,
+    expectedDigest,
+    overrides,
+    readBlob: bridgeBlobContent,
+    targetRoot: runtimeRoot
+  });
+  assertBridgeCommit(capabilities.bridgeCommit);
+  return {
+    mode: needsCompatibilityOverlay
+      ? "capability-overlay"
+      : "verified-snapshot",
+    root: runtimeRoot,
+    script: path.join(runtimeRoot, "scripts", "grok-bridge.mjs"),
+    digest: expectedDigest
+  };
+}
+
 function getCapabilities(overrides = {}) {
-  verifyBridgeCheckout();
+  const verifiedBridge = verifyBridgeCheckout();
+  const trackedEntries = trackedBridgeEntries(verifiedBridge.head);
+  const officialBridgeSource = bridgeBlobContent(
+    bridgeScriptEntry(trackedEntries)
+  ).toString("utf8");
   const version = checked(grokBinary(), ["--version"]);
   const modelOutput = checked(grokBinary(), ["models"]);
   const modelInfo = parseModels(modelOutput);
-  const efforts = bridgeEfforts();
+  const nativeBridgeEfforts = bridgeEfforts(officialBridgeSource);
+  const loadedModelCache = loadModelCache();
+  const catalog = buildModelCapabilityCatalog({
+    bridgeEfforts: nativeBridgeEfforts,
+    grokVersion: version,
+    modelCache: loadedModelCache.cache,
+    modelInfo
+  });
   const model = chooseModel(
     modelInfo,
     overrides.model || process.env.GROK_MODEL || null
   );
-  const effort = overrides.effort ||
-    process.env.GROK_REASONING_EFFORT ||
-    efforts.at(-1);
-  if (!efforts.includes(effort)) {
-    throw new Error(
-      "Reasoning effort " +
-      effort +
-      " is not supported by the current official bridge. Supported: " +
-      efforts.join(", ")
-    );
-  }
   if (!model) {
     throw new Error("No Grok model is available.");
   }
-  const bridgeCommit = checked(gitBinary(), [
-    "-C",
-    VENDOR_REPOSITORY,
-    "rev-parse",
-    "HEAD"
-  ]);
-  return {
-    ready: true,
+  const effort = chooseReasoningEffort(
+    catalog,
+    model,
+    overrides.effort || process.env.GROK_REASONING_EFFORT || null
+  );
+  const capabilities = {
+    ready: false,
     grokVersion: version,
-    bridgeCommit,
+    bridgeCommit: verifiedBridge.head,
     bridgeScript: BRIDGE_SCRIPT,
     pluginDataRoot: PLUGIN_DATA_ROOT,
     availableModels: modelInfo.models,
     defaultModel: modelInfo.defaultModel,
+    modelCapabilities: catalog.models,
+    capabilitySource: catalog.source,
+    capabilityWarning: loadedModelCache.warning || catalog.warning,
+    modelCatalogFile: MODEL_CACHE_FILE,
+    modelCatalogFetchedAt: catalog.fetchedAt,
+    bridgeNativeReasoningEfforts: nativeBridgeEfforts,
+    pluginSupportedReasoningEfforts: unionReasoningEfforts(catalog),
     selectedModel: model,
-    supportedReasoningEfforts: efforts,
+    supportedReasoningEfforts:
+      catalog.models[model].supportedReasoningEfforts,
     selectedReasoningEffort: effort
   };
+  capabilities.bridgeRuntime = bridgeRuntime(capabilities);
+  capabilities.ready = true;
+  return capabilities;
+}
+
+function printCapabilityWarning(capabilities) {
+  if (capabilities.capabilityWarning) {
+    process.stderr.write(
+      "[grok-build] warning: " + capabilities.capabilityWarning + "\n"
+    );
+  }
 }
 
 function syncAll(overrides = {}) {
@@ -516,6 +612,9 @@ function syncAll(overrides = {}) {
     result.warnings.push("Bridge update check failed: " + error.message);
   }
   const capabilities = getCapabilities(overrides);
+  if (capabilities.capabilityWarning) {
+    result.warnings.push(capabilities.capabilityWarning);
+  }
   result.ready = capabilities.ready;
   result.capabilities = capabilities;
   return result;
@@ -540,13 +639,13 @@ function passthrough(command, args, env = childEnvironment()) {
   child.on("close", (code) => process.exit(code ?? 1));
 }
 
-function bridgeEnvironment() {
+function bridgeEnvironment(bridgeRoot = BRIDGE_ROOT) {
   fs.mkdirSync(PLUGIN_DATA_ROOT, { recursive: true });
   return childEnvironment({
     GROK_BINARY: grokBinary(),
-    PLUGIN_ROOT: BRIDGE_ROOT,
+    PLUGIN_ROOT: bridgeRoot,
     PLUGIN_DATA: PLUGIN_DATA_ROOT,
-    CLAUDE_PLUGIN_ROOT: BRIDGE_ROOT,
+    CLAUDE_PLUGIN_ROOT: bridgeRoot,
     CLAUDE_PLUGIN_DATA: PLUGIN_DATA_ROOT
   });
 }
@@ -573,7 +672,7 @@ function printUsage() {
     "  grok-codex.mjs runs|show|stop|import [bridge options]",
     "  grok-codex.mjs direct [--no-sync] [--write] [--unsafe-always-approve] [native grok options]",
     "",
-    "Defaults are selected from grok models and the official bridge effort list.",
+    "Defaults use the newest grok models entry and that model's highest advertised effort.",
     "Set GROK_MODEL or GROK_REASONING_EFFORT for an explicit override.",
     ""
   ].join("\n"));
@@ -597,14 +696,14 @@ async function main() {
   }
 
   if (command === "capabilities") {
-    const model = takeOption(args, "model");
-    const effort = takeOption(args, "effort");
+    const overrides = extractCapabilityOverrides(args);
+    args.splice(0, args.length, ...overrides.args);
     if (args.length > 0) {
       throw new Error("Unknown capabilities arguments: " + args.join(" "));
     }
     const result = resolveCommandCapabilities({
       noSync,
-      overrides: { model, effort },
+      overrides,
       sync: syncForCommand,
       probe: getCapabilities
     });
@@ -619,16 +718,18 @@ async function main() {
       sync: syncForCommand,
       probe: getCapabilities
     });
+    const runtime = bridgeRuntime(capabilities);
     const bridgeCheck = run(
       process.execPath,
-      [BRIDGE_SCRIPT, "check", "--json"],
-      { env: bridgeEnvironment() }
+      [runtime.script, "check", "--json"],
+      { env: bridgeEnvironment(runtime.root) }
     );
     if (bridgeCheck.status !== 0) {
       throw new Error((bridgeCheck.stderr || bridgeCheck.stdout).trim());
     }
     const result = {
       capabilities,
+      bridgeRuntime: runtime,
       bridge: JSON.parse(bridgeCheck.stdout)
     };
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -642,17 +743,16 @@ async function main() {
         "Use direct --write for workspace-bounded implementation."
       );
     }
-    const explicitModel = takeOption(args, "model");
-    const explicitEffort = takeOption(args, "effort");
+    const overrides = extractCapabilityOverrides(args);
+    args.splice(0, args.length, ...overrides.args);
     const capabilities = resolveCommandCapabilities({
       noSync,
-      overrides: {
-        model: explicitModel,
-        effort: explicitEffort
-      },
+      overrides,
       sync: syncForCommand,
       probe: getCapabilities
     });
+    const runtime = bridgeRuntime(capabilities);
+    if (noSync) printCapabilityWarning(capabilities);
     process.stderr.write(
       "[grok-build] model=" +
       capabilities.selectedModel +
@@ -662,12 +762,14 @@ async function main() {
       capabilities.grokVersion +
       " bridge=" +
       capabilities.bridgeCommit.slice(0, 12) +
+      " bridge_mode=" +
+      runtime.mode +
       "\n"
     );
     passthrough(
       process.execPath,
       [
-        BRIDGE_SCRIPT,
+        runtime.script,
         command,
         "--model",
         capabilities.selectedModel,
@@ -676,7 +778,7 @@ async function main() {
         ...(asJson ? ["--json"] : []),
         ...args
       ],
-      bridgeEnvironment()
+      bridgeEnvironment(runtime.root)
     );
     return;
   }
@@ -699,8 +801,8 @@ async function main() {
   if (command === "direct") {
     const write = takeSwitch(args, "write");
     const unsafeAlwaysApprove = takeSwitch(args, "unsafe-always-approve");
-    const explicitModel = takeOption(args, "model");
-    const explicitEffort = takeOption(args, "effort");
+    const overrides = extractCapabilityOverrides(args, { direct: true });
+    args.splice(0, args.length, ...overrides.args);
     const safetyArgs = buildDirectSafetyArgs(args, {
       write,
       unsafeAlwaysApprove
@@ -710,13 +812,11 @@ async function main() {
     }
     const capabilities = resolveCommandCapabilities({
       noSync,
-      overrides: {
-        model: explicitModel,
-        effort: explicitEffort
-      },
+      overrides,
       sync: syncForCommand,
       probe: getCapabilities
     });
+    if (noSync) printCapabilityWarning(capabilities);
     const nativeArgs = [
       "--model",
       capabilities.selectedModel,
